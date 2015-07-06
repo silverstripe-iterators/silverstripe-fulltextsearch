@@ -121,9 +121,65 @@ As you can only search one index at a time, all searchable classes need to be in
 		}
 	}
 
+## Using Multiple Indexes
+
+Multiple indexes can be created and searched independently, but if you wish to override an existing
+index with another, you can use the `$hide_ancestor` config.
+
+	:::php
+	class MyReplacementIndex extends MyIndex {
+		private static $hide_ancestor = 'MyIndex';
+
+		public function init() {
+			parent::init();
+			$this->addClass('File');
+			$this->addFulltextField('Title');
+		}
+	}
+
+You can also filter all indexes globally to a set of pre-defined classes if you wish to 
+prevent any unknown indexes from being automatically included.
+
+	:::yaml
+	FullTextSearch:
+	  indexes:
+	    - MyReplacementIndex
+	    - CoreSearchIndex
+
+
 ## Indexing Relationships
 
 TODO
+
+## Pre-filtering Indexed Records
+
+Sometimes you only want to filter a subset of all records of a certain type,
+e.g. to avoid unnecessarily large indices, or to simplify queries by excluding
+records that should never match any query variation.
+
+Example: Add `File` records, but filter for documents only (by extension)
+
+	<?php
+	class MyIndex extends SolrIndex {
+		function init() {
+			$extCategories = File::config()->get('app_categories');
+			$filesList = File::get()->where(
+				implode(
+					' OR ', 
+					array_map(
+						function($ext) {return '"Filename" LIKE \'%.' . Convert::raw2sql($ext) . '\'';}, 
+						$extCategories['doc']
+					)
+				)
+			);
+			$this->addClass('File', array('list' => $filesList));
+			// ...
+		}
+	}
+
+Please take care when using this method for records with "variant states" such
+as the `Versioned` extension. These add filters on query creation, based on the current
+context, and need to be unset to avoid unwanted side effects.
 
 ## Weighting/Boosting Fields
 

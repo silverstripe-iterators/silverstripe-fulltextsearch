@@ -163,7 +163,7 @@ class Solr_Configure extends BuildTask {
 		} else {
 			user_error('Unknown Solr index mode '.$indexstore['mode'], E_USER_ERROR);
 		}
-		
+
 		foreach ($indexes as $instance) {
 			$index = $instance->getIndexName();
 			echo "Configuring $index. \n"; flush();
@@ -200,7 +200,14 @@ class Solr_Configure extends BuildTask {
 
 
 class Solr_Reindex extends BuildTask {
-	static $recordsPerRequest = 200;
+
+	/**
+	 * Number of records to load and index per request
+	 *
+	 * @var int
+	 * @config
+	 */
+	private static $recordsPerRequest = 200;
 
 	public function run($request) {
 		increase_time_limit_to();
@@ -223,30 +230,31 @@ class Solr_Reindex extends BuildTask {
 
 			foreach (Solr::get_indexes() as $index => $instance) {
 				echo "Rebuilding {$instance->getIndexName()}\n\n";
-				
+
 				$classes = $instance->getClasses();
 				if($request->getVar('class')) {
 					$limitClasses = explode(',', $request->getVar('class'));
 					$classes = array_intersect_key($classes, array_combine($limitClasses, $limitClasses));
 				}
 
-				Solr::service($index)->deleteByQuery('ClassHierarchy:(' . implode(' OR ', array_keys($classes)) . ')');
+				if($classes) {
+					Solr::service($index)->deleteByQuery('ClassHierarchy:(' . implode(' OR ', array_keys($classes)) . ')');	
+				}
 
 				foreach ($classes as $class => $options) {
 					$includeSubclasses = $options['include_children'];
-					
+
 					foreach (SearchVariant::reindex_states($class, $includeSubclasses) as $state) {
 						if ($instance->variantStateExcluded($state)) continue;
-						
+
 						SearchVariant::activate_state($state);
 
-						$filter = $includeSubclasses ? "" : '"ClassName" = \''.$class."'";
-						$singleton = singleton($class);
-						$query = $singleton->get($class,$filter,null);
-						$dtaQuery = $query->dataQuery();
+						$list = ($options['list']) ? $options['list'] : DataList::create($class);
+						if (!$options['include_children']) $list = $list->filter('ClassName', $class);
+						$dtaQuery = $list->dataQuery();						
 						$sqlQuery = $dtaQuery->getFinalisedQuery();
-						$singleton->extend('augmentSQL',$sqlQuery,$dtaQuery);
-						$total = $query->count();
+						singleton($class)->extend('augmentSQL',$sqlQuery,$dtaQuery);
+						$total = $list->count();
 
 						$statevar = json_encode($state);
 						echo "Class: $class, total: $total";
@@ -259,12 +267,12 @@ class Solr_Reindex extends BuildTask {
 							echo "$offset..";
 
 							$cmd = "php $script dev/tasks/$self index=$index class=$class start=$offset variantstate=$statevar";
-							
+
 							if($verbose) {
 								echo "\n  Running '$cmd'\n";
-								$cmd .= " verbose=1";
+								$cmd .= " verbose=1 2>&1";
 							}
-							
+
 							$res = $verbose ? passthru($cmd) : `$cmd`;
 							if($verbose) echo "  ".preg_replace('/\r\n|\n/', '$0  ', $res)."\n";
 
@@ -274,6 +282,8 @@ class Solr_Reindex extends BuildTask {
 							// This will slow down things a tiny bit, but it is done so that we don't timeout to the database during a reindex
 							DB::query('SELECT 1');
 						}
+
+						echo "\n";
 					}
 				}
 
@@ -294,17 +304,18 @@ class Solr_Reindex extends BuildTask {
 		$includeSubclasses = $options['include_children'];
 		$filter = $includeSubclasses ? "" : '"ClassName" = \''.$class."'";
 
-		$items = DataList::create($class)
-			->where($filter)
-			->limit($this->stat('recordsPerRequest'), $start);
+		$items = ($options['list']) ? $options['list'] : DataList::create($class);
+		if(!$options['include_children']) $items = $items->filter('ClassName', $class);
+		$items = $items->limit($this->stat('recordsPerRequest'), $start);
 
 		if($verbose) echo "Adding $class";
 		foreach ($items as $item) {
 			if($verbose) echo $item->ID . ' ';
 
-			$index->add($item);
+			// See SearchUpdater_ObjectHandler::triggerReindex
+			$item->triggerReindex();
 
-			$item->destroy(); 
+			$item->destroy();
 		}
 
 		if($verbose) echo "Done ";
