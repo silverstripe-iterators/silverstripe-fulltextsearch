@@ -31,6 +31,30 @@ abstract class SolrIndex extends SearchIndex {
 	protected $extrasPath = null;
 
 	protected $templatesPath = null;
+	
+	/**
+	 * List of boosted fields
+	 *
+	 * @var array
+	 */
+	protected $boostedFields = array();
+
+	/**
+	 * Name of default field
+	 *
+	 * @var string
+	 * @config
+	 */
+	private static $default_field = '_text';
+
+	/**
+	 * List of copy fields all fulltext fields should be copied into.
+	 * This will fallback to default_field if not specified
+	 *
+	 * @var array
+	 */
+	private static $copy_fields = array();
+	
 	/**
 	 * @return String Absolute path to the folder containing
 	 * templates which are used for generating the schema and field definitions.
@@ -79,7 +103,32 @@ abstract class SolrIndex extends SearchIndex {
 		}
 	}
 
-	function getFieldDefinitions() {
+	/**
+	 * Get the default text field, normally '_text'
+	 *
+	 * @return string
+	 */
+	public function getDefaultField() {
+		return $this->config()->default_field;
+	}
+
+	/**
+	 * Get list of fields each text field should be copied into.
+	 * This will fallback to the default field if omitted.
+	 *
+	 * @return array
+	 */
+	protected function getCopyDestinations() {
+		$copyFields = $this->config()->copy_fields;
+		if($copyFields) {
+			return $copyFields;
+		}
+		// Fallback to default field
+		$df = $this->getDefaultField();
+		return array($df);
+	}
+
+	public function getFieldDefinitions() {
 		$xml = array();
 		$stored = $this->getStoredDefault();
 
@@ -95,7 +144,8 @@ abstract class SolrIndex extends SearchIndex {
 
 		// Add the fulltext collation field
 
-		$xml[] = "<field name='_text' type='htmltext' indexed='true' stored='$stored' multiValued='true' />" ;
+		$df = $this->getDefaultField();
+		$xml[] = "<field name='{$df}' type='htmltext' indexed='true' stored='{$stored}' multiValued='true' />" ;
 
 		// Add the user-specified fields
 
@@ -114,6 +164,26 @@ abstract class SolrIndex extends SearchIndex {
 		}
 		
 		return implode("\n\t\t", $xml);
+	}
+	
+	/**
+	 * Extract first suggestion text from collated values
+	 * 
+	 * @param mixed $collation
+	 * @return string
+	 */
+	protected function getCollatedSuggestion($collation = '') {
+		if(is_string($collation)) {
+			return $collation;
+		}
+		if(is_object($collation)) {
+			if(isset($collation->misspellingsAndCorrections)) {
+				foreach($collation->misspellingsAndCorrections as $key => $value) {
+					return $value;
+				}
+			}
+		}
+		return '';
 	}
 
 	/**
@@ -154,6 +224,93 @@ abstract class SolrIndex extends SearchIndex {
 	public function addStoredField($field, $forceType = null, $extraOptions = array()) {
 		$options = array_merge($extraOptions, array('stored' => 'true'));
 		$this->addFulltextField($field, $forceType, $options);
+	}
+	
+	/**
+	 * Add a fulltext field with a boosted value
+	 * 
+	 * @param string $field The field to add
+	 * @param string $forceType The type to force this field as (required in some cases, when not
+	 * detectable from metadata)
+	 * @param array $extraOptions Dependent on search implementation
+	 * @param float $boost Numeric boosting value (defaults to 2)
+	 */
+	public function addBoostedField($field, $forceType = null, $extraOptions = array(), $boost = 2) {
+		$options = array_merge($extraOptions, array('boost' => $boost));
+		$this->addFulltextField($field, $forceType, $options);
+	}
+	
+
+	public function fieldData($field, $forceType = null, $extraOptions = array()) {
+		// Ensure that 'boost' is recorded here without being captured by solr
+		$boost = null;
+		if(array_key_exists('boost', $extraOptions)) {
+			$boost = $extraOptions['boost'];
+			unset($extraOptions['boost']);
+		}
+		$data = parent::fieldData($field, $forceType, $extraOptions);
+		
+		// Boost all fields with this name
+		if(isset($boost)) {
+			foreach($data as $fieldName => $fieldInfo) {
+				$this->boostedFields[$fieldName] = $boost;
+			}
+		}
+		return $data;
+	}
+	
+	/**
+	 * Set the default boosting level for a specific field.
+	 * Will control the default value for qf param (Query Fields), but will not 
+	 * override a query-specific value.
+	 * 
+	 * Fields must be added before having a field boosting specified
+	 * 
+	 * @param string $field Full field key (Model_Field)
+	 * @param float|null $level Numeric boosting value. Set to null to clear boost
+	 */
+	public function setFieldBoosting($field, $level) {
+		if(!isset($this->fulltextFields[$field])) {
+			throw new InvalidArgumentException("No fulltext field $field exists on ".$this->getIndexName());
+		}
+		if($level === null) {
+			unset($this->boostedFields[$field]);
+		} else {
+			$this->boostedFields[$field] = $level;
+		}
+	}
+	
+	/**
+	 * Get all boosted fields
+	 * 
+	 * @return array
+	 */
+	public function getBoostedFields() {
+		return $this->boostedFields;
+	}
+	
+	/**
+	 * Determine the best default value for the 'qf' parameter
+	 * 
+	 * @return array|null List of query fields, or null if not specified
+	 */
+	public function getQueryFields() {
+		// Not necessary to specify this unless boosting
+		if(empty($this->boostedFields)) {
+			return null;
+		}
+		$queryFields = array();
+		foreach ($this->boostedFields as $fieldName => $boost) {
+			$queryFields[] = $fieldName . '^' . $boost;
+		}
+
+		// If any fields are queried, we must always include the default field, otherwise it will be excluded
+		$df = $this->getDefaultField();
+		if($queryFields && !isset($this->boostedFields[$df])) {
+			$queryFields[] = $df;
+		}
+		
+		return $queryFields;
 	}
 
 	/**
@@ -232,13 +389,22 @@ abstract class SolrIndex extends SearchIndex {
 		);
 	}
 
-	function getCopyFieldDefinitions() {
+	/**
+	 * Generate XML for copy field definitions
+	 *
+	 * @return string
+	 */
+	public function getCopyFieldDefinitions() {
 		$xml = array();
 
-		foreach ($this->fulltextFields as $name => $field) {
-			$xml[] = "<copyField source='{$name}' dest='_text' />";
+		// Default copy fields
+		foreach($this->getCopyDestinations() as $copyTo) {
+			foreach ($this->fulltextFields as $name => $field) {
+				$xml[] = "<copyField source='{$name}' dest='{$copyTo}' />";
+			}
 		}
 
+		// Explicit copy fields
 		foreach ($this->copyFields as $source => $fields) {
 			foreach($fields as $fieldAttrs) {
 				$xml[] = $this->toXmlTag('copyField', $fieldAttrs);
@@ -358,20 +524,26 @@ abstract class SolrIndex extends SearchIndex {
 	 * @param SearchQuery $query
 	 * @param integer $offset
 	 * @param integer $limit
-	 * @param  Array $params Extra request parameters passed through to Solr
+	 * @param array $params Extra request parameters passed through to Solr
 	 * @return ArrayData Map with the following keys: 
 	 *  - 'Matches': ArrayList of the matched object instances
 	 */
 	public function search(SearchQuery $query, $offset = -1, $limit = -1, $params = array()) {
 		$service = $this->getService();
-		
-		SearchVariant::with(count($query->classes) == 1 ? $query->classes[0]['class'] : null)->call('alterQuery', $query, $this);
 
-		$q = array();
-		$fq = array();
+		$searchClass = count($query->classes) == 1
+			? $query->classes[0]['class']
+			: null;
+		SearchVariant::with($searchClass)
+			->call('alterQuery', $query, $this);
+
+		$q = array(); // Query
+		$fq = array(); // Filter query
+		$qf = array(); // Query fields
+		$hlq = array(); // Highlight query
 
 		// Build the search itself
-
+		
 		foreach ($query->search as $search) {
 			$text = $search['text'];
 			preg_match_all('/"[^"]*"|\S+/', $text, $parts);
@@ -380,7 +552,9 @@ abstract class SolrIndex extends SearchIndex {
 
 			foreach ($parts[0] as $part) {
 				$fields = (isset($search['fields'])) ? $search['fields'] : array();
-				if(isset($search['boost'])) $fields = array_merge($fields, array_keys($search['boost']));
+				if(isset($search['boost'])) {
+					$fields = array_merge($fields, array_keys($search['boost']));
+				}
 				if ($fields) {
 					$searchq = array();
 					foreach ($fields as $field) {
@@ -392,7 +566,13 @@ abstract class SolrIndex extends SearchIndex {
 				else {
 					$q[] = '+'.$part.$fuzzy;
 				}
+				$hlq[] = $part;
 			}
+		}
+		// If using boosting, set the clean term separately for highlighting.
+		// See https://issues.apache.org/jira/browse/SOLR-2632
+		if(array_key_exists('hl', $params) && !array_key_exists('hl.q', $params)) {
+			$params['hl.q'] = implode(' ', $hlq);
 		}
 
 		// Filter by class if requested
@@ -454,10 +634,24 @@ abstract class SolrIndex extends SearchIndex {
 
 			$fq[] = ($missing ? "+{$field}:[* TO *] " : '') . '-('.implode(' ', $excludeq).')';
 		}
+		
+		// Prepare query fields unless specified explicitly
+		if(isset($params['qf'])) {
+			$qf = $params['qf'];
+		} else {
+			$qf = $this->getQueryFields();
+		}
+		if(is_array($qf)) {
+			$qf = implode(' ', $qf);
+		}
+		if($qf) {
+			$params['qf'] = $qf;
+		}
 
 		if(!headers_sent() && !Director::isLive()) {
 			if ($q) header('X-Query: '.implode(' ', $q));
 			if ($fq) header('X-Filters: "'.implode('", "', $fq).'"');
+			if ($qf) header('X-QueryFields: '.$qf);
 		}
 
 		if ($offset == -1) $offset = $query->start;
@@ -465,12 +659,12 @@ abstract class SolrIndex extends SearchIndex {
 		if ($limit == -1) $limit = SearchQuery::$default_page_size;
 
 		$params = array_merge($params, array('fq' => implode(' ', $fq)));
-
+		
 		$res = $service->search(
 			$q ? implode(' ', $q) : '*:*', 
 			$offset, 
 			$limit, 
-			$params, 
+			$params,
 			Apache_Solr_Service::METHOD_POST
 		);
 
@@ -527,15 +721,18 @@ abstract class SolrIndex extends SearchIndex {
 
 			// Suggestions. Requires spellcheck.collate=true in $params
 			if(isset($res->spellcheck->suggestions->collation)) {
+				// Extract string suggestion
+				$suggestion = $this->getCollatedSuggestion($res->spellcheck->suggestions->collation);
+				
 				// The collation, including advanced query params (e.g. +), suitable for making another query programmatically.
-				$ret['Suggestion'] = $res->spellcheck->suggestions->collation;
+				$ret['Suggestion'] = $suggestion;
 
 				// A human friendly version of the suggestion, suitable for 'Did you mean $SuggestionNice?' display.
-				$ret['SuggestionNice'] = $this->getNiceSuggestion($res->spellcheck->suggestions->collation);
+				$ret['SuggestionNice'] = $this->getNiceSuggestion($suggestion);
 
 				// A string suitable for appending to an href as a query string.
 				// For example <a href="http://example.com/search?q=$SuggestionQueryString">$SuggestionNice</a>
-				$ret['SuggestionQueryString'] = $this->getSuggestionQueryString($res->spellcheck->suggestions->collation);
+				$ret['SuggestionQueryString'] = $this->getSuggestionQueryString($suggestion);
 			}
 		}
 
@@ -555,5 +752,26 @@ abstract class SolrIndex extends SearchIndex {
 	public function setService(SolrService $service) {
 		$this->service = $service;
 		return $this;
+	}
+	
+	/**
+	 * Upload config for this index to the given store
+	 * 
+	 * @param SolrConfigStore $store
+	 */
+	public function uploadConfig($store) {
+		// Upload the config files for this index
+		$store->uploadString(
+			$this->getIndexName(),
+			'schema.xml',
+			(string)$this->generateSchema()
+		);
+
+		// Upload additional files
+		foreach (glob($this->getExtrasPath().'/*') as $file) {
+			if (is_file($file)) {
+				$store->uploadFile($this->getIndexName(), $file);
+			}
+		}
 	}
 }
